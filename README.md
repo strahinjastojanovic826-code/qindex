@@ -57,8 +57,6 @@ fn main() {
     let bytes: &[u8] = index.as_bytes();
 }
 
-```
-
 GPU Integration (Compute Shader)
 
 Because qindex packs 16 states into each 32-bit word (u32), you can send the raw buffer directly to a GPU Compute Shader (WGSL/HLSL/CUDA) and unpack the states on GPU cores with virtually zero performance overhead:
