@@ -1,0 +1,19 @@
+[package]
+name = "qindex"
+version = "0.1.0"
+edition = "2024"
+authors = ["Strale <strahinjastojanovic826@gmail.com>"]
+description = "A zero-dependency, 2-bit quaternary indexing library optimized for RAM compression and GPU DMA transfers."
+readme = "README.md"
+repository = "https://github.com/korisnicko-ime/qindex" # Zamenik sa svojim GitHub linkom
+license = "AGPL-3.0-or-later"
+keywords = ["quaternary", "bit-packing", "gpu", "dma", "no-deps"]
+categories = ["data-structures", "encoding", "hardware-support"]
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
