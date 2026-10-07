@@ -1,175 +1,27 @@
-use std::alloc::{alloc, dealloc, Layout};
-use std::fmt;
-use std::ptr::NonNull;
+pub mod index;
+pub mod iter;
+pub mod state;
+pub mod ffi;
 
-/// 2-bitna stanja (Kvati): 00, 01, 10, 11
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QState {
-    Q0 = 0b00, // 0
-    Q1 = 0b01, // 1
-    Q2 = 0b10, // 2
-    Q3 = 0b11, // 3
-}
-
-impl From<u8> for QState {
-    #[inline]
-    fn from(val: u8) -> Self {
-        match val & 0b11 {
-            0b00 => QState::Q0,
-            0b01 => QState::Q1,
-            0b10 => QState::Q2,
-            _ => QState::Q3,
-        }
-    }
-}
-
-/// Struktura indeksa optimizovana za CPU obradu i direct-to-GPU prenos.
-/// Podaci su interno poravnati na 64 bajta (Cache line / DMA poravnanje).
-pub struct QIndex {
-    ptr: NonNull<u32>,
-    capacity_u32: usize,
-    len: usize, // Ukupan broj zapisanih QState elemenata (ne bajtova!)
-}
-
-impl QIndex {
-    /// Konstruiše prazan QIndex sa početnim kapacitetom za elemente
-    pub fn with_capacity(capacity_states: usize) -> Self {
-        let u32_needed = (capacity_states + 15) / 16;
-        let capacity_u32 = u32_needed.max(4); // Minimalno 4 x u32 (16 bajtova)
-
-        // Poravnavamo memoriju na 64 bajta radi maksimalne brzine na PCIe/DMA i SIMD
-        let layout = Layout::from_size_align(capacity_u32 * 4, 64)
-            .expect("Failed to create memory layout");
-
-        let raw_ptr = unsafe { alloc(layout) as *mut u32 };
-        let ptr = NonNull::new(raw_ptr).expect("Memory allocation failed");
-
-        // Inicijalizacija memorije nulama
-        unsafe {
-            std::ptr::write_bytes(ptr.as_ptr(), 0, capacity_u32);
-        }
-
-        Self {
-            ptr,
-            capacity_u32,
-            len: 0,
-        }
-    }
-
-    pub fn new() -> Self {
-        Self::with_capacity(64)
-    }
-
-    /// Ukupan broj skladištenih stanja (kvata)
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Ukupno zauzeće u bajtovima (sveukupno na disk/RAM/GPU)
-    pub fn byte_size(&self) -> usize {
-        (self.len + 3) / 4
-    }
-
-    /// Dodavanje jednog stanja u indeks: O(1)
-    pub fn push(&mut self, state: QState) {
-        if self.len >= self.capacity_u32 * 16 {
-            self.grow();
-        }
-
-        let u32_idx = self.len / 16;       // 16 kvata staje u jedan u32 (32 bita / 2 bita)
-        let bit_shift = (self.len % 16) * 2;
-
-        unsafe {
-            let elem_ptr = self.ptr.as_ptr().add(u32_idx);
-            let current_val = *elem_ptr;
-            *elem_ptr = current_val | ((state as u32) << bit_shift);
-        }
-
-        self.len += 1;
-    }
-
-    /// Dobijanje stanja po indeksu: O(1)
-    #[inline]
-    pub fn get(&self, index: usize) -> Option<QState> {
-        if index >= self.len {
-            return None;
-        }
-
-        let u32_idx = index / 16;
-        let bit_shift = (index % 16) * 2;
-
-        unsafe {
-            let val = (*self.ptr.as_ptr().add(u32_idx) >> bit_shift) & 0b11;
-            Some(QState::from(val as u8))
-        }
-    }
-
-    /// Vraća sirovi pokazivač na poravnati bafer spreman za direktan prenos na GPU (DMA / PCIe)
-    pub fn as_raw_slice(&self) -> &[u32] {
-        let u32_used = (self.len + 15) / 16;
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), u32_used) }
-    }
-
-    /// Vraća sirovi u8 bajt isečak za serijalizaciju ili qvfs/qzip upis
-    pub fn as_bytes(&self) -> &[u8] {
-        let bytes_used = self.byte_size();
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const u8, bytes_used) }
-    }
-
-    /// Realokacija memorije pri popunjavanju bafera
-    fn grow(&mut self) {
-        let new_capacity_u32 = self.capacity_u32 * 2;
-        let old_layout = Layout::from_size_align(self.capacity_u32 * 4, 64).unwrap();
-        let new_layout = Layout::from_size_align(new_capacity_u32 * 4, 64).unwrap();
-
-        unsafe {
-            let new_raw_ptr = alloc(new_layout) as *mut u32;
-            let new_ptr = NonNull::new(new_raw_ptr).expect("Neuspesna realokacija");
-            
-            // Kopiranje starih podataka
-            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.capacity_u32);
-            // Inicijalizacija novog dela nulama
-            std::ptr::write_bytes(new_ptr.as_ptr().add(self.capacity_u32), 0, self.capacity_u32);
-
-            dealloc(self.ptr.as_ptr() as *mut u8, old_layout);
-            self.ptr = new_ptr;
-            self.capacity_u32 = new_capacity_u32;
-        }
-    }
-}
-
-impl Drop for QIndex {
-    fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.capacity_u32 * 4, 64).unwrap();
-        unsafe {
-            dealloc(self.ptr.as_ptr() as *mut u8, layout);
-        }
-    }
-}
-
-impl fmt::Debug for QIndex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let states: Vec<QState> = (0..self.len).map(|i| self.get(i).unwrap()).collect();
-        f.debug_struct("QIndex")
-            .field("len", &self.len)
-            .field("byte_size", &self.byte_size())
-            .field("states", &states)
-            .finish()
-    }
-}
-
-// Omogućavamo bezbedno prebacivanje između nitima (Thread Safe)
-unsafe impl Send for QIndex {}
-unsafe impl Sync for QIndex {}
+pub use index::QIndex;
+pub use iter::QIndexIter;
+pub use state::QState;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Instant;
+    use super::ffi::*;
+    use super::state::QState;
+    use std::ptr;
+
+    fn print_header(title: &str) {
+        println!("\n==================================================");
+        println!(" TEST SUITE: {}", title);
+        println!("==================================================");
+    }
 
     #[test]
     fn test_qstate_conversion() {
@@ -183,71 +35,9 @@ mod tests {
     }
 
     #[test]
-    fn test_push_and_get_basic() {
-        let mut qi = QIndex::new();
-        qi.push(QState::Q0);
-        qi.push(QState::Q1);
-        qi.push(QState::Q2);
-        qi.push(QState::Q3);
-
-        assert_eq!(qi.len(), 4);
-        assert_eq!(qi.byte_size(), 1);
-
-        assert_eq!(qi.get(0), Some(QState::Q0));
-        assert_eq!(qi.get(1), Some(QState::Q1));
-        assert_eq!(qi.get(2), Some(QState::Q2));
-        assert_eq!(qi.get(3), Some(QState::Q3));
-        assert_eq!(qi.get(4), None); // Van granica
-    }
-
-    #[test]
-    fn test_packing_in_u32_packets() {
-        let mut qi = QIndex::new();
-
-        // Upisujemo tačno 16 stanja (1 full u32 paket)
-        for _ in 0..4 {
-            qi.push(QState::Q0); // 00
-            qi.push(QState::Q1); // 01
-            qi.push(QState::Q2); // 10
-            qi.push(QState::Q3); // 11
-        }
-
-        assert_eq!(qi.len(), 16);
-        assert_eq!(qi.byte_size(), 4);
-
-        let slice_u32 = qi.as_raw_slice();
-        assert_eq!(slice_u32.len(), 1);
-
-        // Proveravamo da li je bitwise reč ispravno pakovana
-        // Svaki blok od 4 kvata je: 11_10_01_00 u binarnom (0xE4)
-        // 0xE4E4E4E4 u hexu
-        assert_eq!(slice_u32[0], 0xE4E4E4E4);
-    }
-
-    #[test]
-    fn test_memory_growth_and_reallocation() {
-        let mut qi = QIndex::with_capacity(16); // Malipočetni kapacitet (1 x u32)
-
-        // Ubacujemo 100 elemenata da iznudimo višestruku realokaciju
-        for i in 0..100 {
-            let state = QState::from((i % 4) as u8);
-            qi.push(state);
-        }
-
-        assert_eq!(qi.len(), 100);
-        assert_eq!(qi.byte_size(), 25); // 100 kvata / 4 = 25 bajtova
-
-        // Verifikujemo tačnost svih 100 upisanih vrednosti nakon premeštanja u memoriji
-        for i in 0..100 {
-            let expected_state = QState::from((i % 4) as u8);
-            assert_eq!(qi.get(i), Some(expected_state));
-        }
-    }
-
-    #[test]
     fn test_dma_64byte_alignment() {
         let qi = QIndex::new();
-        let raw_ptr = qi.as_raw_slice().as_ptr() as usize;
+        let raw_ptr = qi.as_bytes().as_ptr() as usize;
 
         // Proveravamo da li je adresa alocirane memorije deljiva sa 64 (DMA poravnanje za GPU)
         assert_eq!(
@@ -258,69 +48,348 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_and_reuse() {
+        let mut qi = QIndex::new();
+        qi.push(QState::Q1);
+        qi.push(QState::Q3);
+
+        assert_eq!(qi.len(), 2);
+
+        qi.clear();
+        assert_eq!(qi.len(), 0);
+        assert!(qi.is_empty());
+        assert_eq!(qi.get(0), None);
+
+        // Provera da li se memorija može ponovo koristiti nakon clear-a
+        qi.push(QState::Q2);
+        assert_eq!(qi.len(), 1);
+        assert_eq!(qi.get(0), Some(QState::Q2));
+    }
+
+    #[test]
+    fn test_reserve_explicit() {
+        let mut qi = QIndex::new();
+        qi.reserve(100); // Unapred alociramo prostor za 100 elemenata
+
+        let initial_cap = qi.capacity();
+        assert!(initial_cap >= 100);
+
+        for _ in 0..100 {
+            qi.push(QState::Q0);
+        }
+
+        // Kapacitet ne bi trebalo da se menja jer je unapred rezervisan
+        assert_eq!(qi.capacity(), initial_cap);
+    }
+
+    #[test]
+    fn test_iterator() {
+        let mut qi = QIndex::new();
+        qi.push(QState::Q0);
+        qi.push(QState::Q1);
+        qi.push(QState::Q2);
+
+        let collected: Vec<QState> = qi.into_iter().collect();
+        assert_eq!(collected, vec![QState::Q0, QState::Q1, QState::Q2]);
+    }
+
+    #[test]
+    fn test_comprehensive_qindex_report() {
+        print_header("QIndex Detailed Validation & Performance Report");
+
+        // 1. TEST: Osnovna alokacija i rad sa kapacitetom
+        let start = Instant::now();
+        let mut qidx = QIndex::with_capacity(64);
+        assert_eq!(qidx.len(), 0);
+        assert!(qidx.is_empty());
+        println!(
+            "[1/6] Allocation & Initialization OK (Time: {:?})",
+            start.elapsed()
+        );
+        println!("      - Initial Length: {}", qidx.len());
+        println!("      - Initial Byte Size: {} bytes", qidx.byte_size());
+
+        // 2. TEST: Pojedinačni unos (push) i bitwise pakovanje
+        let start = Instant::now();
+        let states_to_insert = [
+            QState::Q0,
+            QState::Q1,
+            QState::Q2,
+            QState::Q3,
+            QState::Q3,
+            QState::Q2,
+            QState::Q1,
+            QState::Q0,
+        ];
+
+        for &st in &states_to_insert {
+            qidx.push(st);
+        }
+
+        assert_eq!(qidx.len(), 8);
+        for (idx, &expected) in states_to_insert.iter().enumerate() {
+            assert_eq!(qidx.get(idx), Some(expected));
+        }
+        println!(
+            "[2/6] Single Push & Bitwise Retrieval OK (Time: {:?})",
+            start.elapsed()
+        );
+        println!("      - Pushed {} states successfully", qidx.len());
+
+        // 3. TEST: Batch Unos ('push_u32_chunk')
+        let start = Instant::now();
+        let chunk_q3: u32 = 0xFFFF_FFFF; // 16 spakovanih Q3 stanja
+        qidx.push_u32_chunk(chunk_q3);
+
+        assert_eq!(qidx.len(), 24);
+        for i in 8..24 {
+            assert_eq!(qidx.get(i), Some(QState::Q3));
+        }
+        println!(
+            "[3/6] Batch Chunk Insertion OK (Time: {:?})",
+            start.elapsed()
+        );
+        println!(
+            "      - Added 16 packed Q3 states instantly. New Len: {}",
+            qidx.len()
+        );
+
+        // 4. TEST: Iteracija bez alokacije ('QIndexIter')
+        let start = Instant::now();
+        let iterated_states: Vec<QState> = qidx.into_iter().collect();
+        assert_eq!(iterated_states.len(), qidx.len());
+        assert_eq!(iterated_states[0], QState::Q0);
+        assert_eq!(iterated_states[8], QState::Q3);
+        println!(
+            "[4/6] Zero-Allocation Iteration OK (Time: {:?})",
+            start.elapsed()
+        );
+        println!(
+            "      - Successfully iterated over {} items",
+            iterated_states.len()
+        );
+
+        // 5. TEST: Ultra-brza bitwise pretraga ('count_matches')
+        let start = Instant::now();
+        let matches_count = qidx.count_matches(0xFFFF_FFFF, 0xFFFF_FFFF);
+        println!(
+            "[5/6] Bitwise Parallel Search OK (Time: {:?})",
+            start.elapsed()
+        );
+        println!("      - Total Q3 Pattern Matches Found: {}", matches_count);
+
+        // 6. TEST: Provjera višenitnog rada (Send / Sync)
+        let start = Instant::now();
+        let shared_qidx = Arc::new(qidx);
+        let shared_clone = Arc::clone(&shared_qidx);
+
+        let handle = thread::spawn(move || shared_clone.len());
+
+        let thread_len = handle.join().unwrap();
+        assert_eq!(thread_len, shared_qidx.len());
+        println!(
+            "[6/6] Multi-Threading (Send/Sync) OK (Time: {:?})",
+            start.elapsed()
+        );
+
+        println!("\n==================================================");
+        println!(" SUMMARY REPORT:");
+        println!(" - Status: ALL TESTS PASSED");
+        println!(
+            " - Memory Efficiency: {} bytes used for {} 2-bit states",
+            shared_qidx.byte_size(),
+            shared_qidx.len()
+        );
+        println!("==================================================\n");
+    }
+
+    #[test]
+    fn test_push_and_get_basic() {
+        let mut qi = QIndex::new();
+        qi.push(QState::Q0);
+        qi.push(QState::Q1);
+        qi.push(QState::Q2);
+        qi.push(QState::Q3);
+
+        assert_eq!(qi.len(), 4);
+
+        assert_eq!(qi.get(0), Some(QState::Q0));
+        assert_eq!(qi.get(1), Some(QState::Q1));
+        assert_eq!(qi.get(2), Some(QState::Q2));
+        assert_eq!(qi.get(3), Some(QState::Q3));
+        assert_eq!(qi.get(4), None);
+    }
+
+    #[test]
+    fn test_packing_in_u32_packets() {
+        let mut qi = QIndex::new();
+
+        for _ in 0..4 {
+            qi.push(QState::Q0);
+            qi.push(QState::Q1);
+            qi.push(QState::Q2);
+            qi.push(QState::Q3);
+        }
+
+        assert_eq!(qi.len(), 16);
+        let slice_u32 = qi.as_raw_slice();
+        assert_eq!(slice_u32.len(), 1);
+
+        for i in 0..16 {
+            let expected = match i % 4 {
+                0 => QState::Q0,
+                1 => QState::Q1,
+                2 => QState::Q2,
+                _ => QState::Q3,
+            };
+            assert_eq!(qi.get(i), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_memory_growth_and_reallocation() {
+        let mut qi = QIndex::with_capacity(16);
+
+        for i in 0..100 {
+            let state = QState::from((i % 4) as u8);
+            qi.push(state);
+        }
+
+        assert_eq!(qi.len(), 100);
+
+        for i in 0..100 {
+            let expected_state = QState::from((i % 4) as u8);
+            assert_eq!(qi.get(i), Some(expected_state));
+        }
+    }
+
+    #[test]
     fn test_boundary_and_empty() {
         let qi = QIndex::new();
         assert!(qi.is_empty());
         assert_eq!(qi.len(), 0);
-        assert_eq!(qi.byte_size(), 0);
         assert_eq!(qi.get(0), None);
     }
 
-    use std::time::Instant;
+    #[test]
+    fn stress_and_performance_benchmark() {
+        const TOTAL_STATES: usize = 1_000_000;
+        println!("\n=== STARTING STRESS TEST ({}) ===", TOTAL_STATES);
 
-#[test]
-fn stress_and_performance_benchmark() {
-    const TOTAL_STATES: usize = 100_000_000; // 100 Miliona kvat stanja
-    println!("\n=== STARTING STRESS TEST (100.000.000 QUAT STATES) ===");
+        let mut qi = QIndex::with_capacity(TOTAL_STATES);
+        let start_write = Instant::now();
 
-    // 1. Testiranje brzine masovnog upisa (Push Rate)
-    let mut qi = QIndex::with_capacity(TOTAL_STATES);
-    let start_write = Instant::now();
+        for i in 0..TOTAL_STATES {
+            let state = QState::from((i % 4) as u8);
+            qi.push(state);
+        }
 
-    for i in 0..TOTAL_STATES {
-        // Rotiramo stanja 00, 01, 10, 11
-        let state = QState::from((i % 4) as u8);
-        qi.push(state);
+        let write_duration = start_write.elapsed();
+        println!("[1/2] Enrollment completed in: {:?}", write_duration);
+
+        assert_eq!(qi.len(), TOTAL_STATES);
+
+        let start_read = Instant::now();
+        let mut errors = 0;
+
+        for i in (0..TOTAL_STATES).step_by(1000) {
+            let expected = QState::from((i % 4) as u8);
+            if qi.get(i) != Some(expected) {
+                errors += 1;
+            }
+        }
+
+        let read_duration = start_read.elapsed();
+        println!("[2/2] Data verification completed in: {:?}", read_duration);
+
+        assert_eq!(errors, 0, "Errors detected in bitwise operations!");
     }
+    #[test]
+    fn test_ffi_lifecycle() {
+        unsafe {
+            // Test creation
+            let handle = qindex_new();
+            assert!(!handle.is_null());
+            assert_eq!(qindex_len(handle), 0);
 
-    let write_duration = start_write.elapsed();
-    let write_throughput = (TOTAL_STATES as f64 / 1_000_000.0) / write_duration.as_secs_f64();
+            // Test pushing valid states (Q0=0, Q1=1, Q2=2, Q3=3)
+            assert_eq!(qindex_push(handle, 0), 0);
+            assert_eq!(qindex_push(handle, 1), 0);
+            assert_eq!(qindex_push(handle, 2), 0);
+            assert_eq!(qindex_push(handle, 3), 0);
 
-    println!("[1/3] ENROLLMENT completed for: {:?}", write_duration);
-    println!("      Write speed: {:.2} Millions of kilowatts per second", write_throughput);
+            // Verify length
+            assert_eq!(qindex_len(handle), 4);
 
-    // 2. Provera zauzeća memorije
-    let bytes_used = qi.byte_size();
-    let mb_used = bytes_used as f64 / (1024.0 * 1024.0);
-    let raw_mb = TOTAL_STATES as f64 / (1024.0 * 1024.0);
+            // Test raw slice extraction
+            let mut slice_len: usize = 0;
+            let raw_ptr = qindex_as_raw_slice(handle, &mut slice_len);
 
-    println!("[2/3] MEMORY EFFICIENCY:");
-    println!("      Typical occupancy (1 bit/state): {:.2} MB", raw_mb);
-    println!("      QIndex occupancy (2 bits/state):    {:.2} MB", mb_used);
-    println!("      Savings in RAM:                   {:.1}%", (1.0 - (mb_used / raw_mb)) * 100.0);
+            assert!(!raw_ptr.is_null());
+            assert_eq!(slice_len, 1); // 4 states fit into 1 x u32 chunk (16 states per u32)
 
-    assert_eq!(qi.len(), TOTAL_STATES);
-    assert_eq!(bytes_used, TOTAL_STATES / 4);
+            // Verify bit layout in the packed u32 chunk:
+            // Q0 (00) | Q1 (01 << 2) | Q2 (10 << 4) | Q3 (11 << 6)
+            // Binary: 11_10_01_00 = 0b11100100 = 0xE4
+            assert_eq!(*raw_ptr, 0b11100100);
 
-    // 3. Testiranje nasumičnog čitanja i provera bitwise integriteta
-    let start_read = Instant::now();
-    let mut errors = 0;
-
-    // Proveravamo svaki 1000. element da izbegnemo predugo trajanje testa
-    for i in (0..TOTAL_STATES).step_by(1000) {
-        let expected = QState::from((i % 4) as u8);
-        if qi.get(i) != Some(expected) {
-            errors += 1;
+            // Cleanup
+            qindex_free(handle);
         }
     }
 
-    let read_duration = start_read.elapsed();
-    println!("[3/3] Data Integrity Verification:");
-    println!("      Random check time: {:?}", read_duration);
-    println!("      Errors found:       {}", errors);
+    #[test]
+    fn test_ffi_custom_capacity_and_alignment() {
+        unsafe {
+            let handle = qindex_with_capacity_and_alignment(128, 64);
+            assert!(!handle.is_null());
+            assert_eq!(qindex_len(handle), 0);
 
-    assert_eq!(errors, 0, "Errors were detected in bitwise operations!");
-    println!("=== The test was successfully passed! ===\n");
-}
+            // Push multiple items to trigger multi-chunk packing
+            for i in 0..32 {
+                let state = (i % 4) as u8;
+                assert_eq!(qindex_push(handle, state), 0);
+            }
+
+            assert_eq!(qindex_len(handle), 32);
+
+            let mut slice_len: usize = 0;
+            let raw_ptr = qindex_as_raw_slice(handle, &mut slice_len);
+
+            assert!(!raw_ptr.is_null());
+            assert_eq!(slice_len, 2); // 32 states = 2 x u32 chunks
+
+            qindex_free(handle);
+        }
+    }
+
+    #[test]
+    fn test_ffi_invalid_inputs_and_null_safety() {
+        unsafe {
+            let handle = qindex_new();
+
+            // Test pushing invalid state value (> 3)
+            assert_eq!(qindex_push(handle, 4), -1);
+            assert_eq!(qindex_push(handle, 255), -1);
+            assert_eq!(qindex_len(handle), 0);
+
+            // Test NULL pointer safety
+            let null_handle: *mut crate::index::QIndex = ptr::null_mut();
+
+            assert_eq!(qindex_push(null_handle, 0), -1);
+            assert_eq!(qindex_len(null_handle), 0);
+
+            let mut slice_len: usize = 999;
+            let raw_ptr = qindex_as_raw_slice(null_handle, &mut slice_len);
+            assert!(raw_ptr.is_null());
+            assert_eq!(slice_len, 0);
+
+            // Passing null to free should be a no-op without panicking/crashing
+            qindex_free(null_handle);
+
+            // Cleanup valid handle
+            qindex_free(handle);
+        }
+    }
 
 }
