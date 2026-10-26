@@ -1,6 +1,5 @@
 use crate::index::QIndex;
 use crate::state::QState;
-use std::slice;
 
 #[repr(C)]
 pub enum QStateFFI {

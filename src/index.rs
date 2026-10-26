@@ -67,6 +67,20 @@ impl QIndex {
     }
 
     #[inline]
+pub fn set(&mut self, index: usize, state: QState) {
+    assert!(index < self.len, "Index out of bounds");
+    let u32_idx = index / 16;
+    let bit_shift = (index % 16) * 2;
+
+    unsafe {
+        let elem_ptr = self.ptr.as_ptr().add(u32_idx);
+        let current_val = *elem_ptr;
+        let mask = !(0b11u32 << bit_shift);
+        *elem_ptr = (current_val & mask) | ((state as u32) << bit_shift);
+    }
+}
+
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -85,6 +99,11 @@ impl QIndex {
     pub fn byte_size(&self) -> usize {
         (self.len + 15) / 4
     }
+
+    #[inline]
+pub fn as_mut_raw_slice(&mut self) -> &mut [u32] {
+    unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity_u32) }
+}
 
     /// Resets the container without deallocating backing storage.
     pub fn clear(&mut self) {
@@ -193,6 +212,17 @@ impl QIndex {
         }
     }
 
+    pub fn count_state(&self, target: QState) -> usize {
+    let target_val = target as u32;
+    // Create a pattern for the target state across all 16 positions in a u32
+    let mut pattern = 0u32;
+    for i in 0..16 {
+        pattern |= target_val << (i * 2);
+    }
+    let mask = 0xFFFF_FFFF; // all 16 quats checked
+    self.count_matches(pattern, mask)
+}
+
     /// Exposes internal buffer as raw `&[u32]` slice.
     #[inline]
     pub fn as_raw_slice(&self) -> &[u32] {
@@ -205,6 +235,20 @@ impl QIndex {
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const u8, self.byte_size()) }
     }
+
+    pub fn par_count_matches(&self, pattern: u32, mask: u32) -> usize {
+    use rayon::prelude::*;
+    let slice = self.as_raw_slice();
+    
+    slice.par_iter()
+        .map(|&chunk| {
+            let matched = !(chunk ^ pattern) & mask;
+            let even_bits = matched & 0x5555_5555;
+            let odd_bits = (matched >> 1) & 0x5555_5555;
+            (even_bits & odd_bits).count_ones() as usize
+        })
+        .sum()
+}
 
     /// Bulk appends states from a slice.
     pub fn extend_from_slice(&mut self, states: &[QState]) {
@@ -306,5 +350,47 @@ impl fmt::Debug for QIndex {
             .field("capacity_u32", &self.capacity_u32)
             .field("align", &self.align)
             .finish()
+    }
+}
+
+impl serde::Serialize for QIndex {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.len))?;
+        for state in self.into_iter() {
+            seq.serialize_element(&state)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for QIndex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct QIndexVisitor;
+        impl<'de> serde::de::Visitor<'de> for QIndexVisitor {
+            type Value = QIndex;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a sequence of QState values")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut index = QIndex::new();
+                while let Some(state) = seq.next_element()? {
+                    index.push(state);
+                }
+                Ok(index)
+            }
+        }
+        deserializer.deserialize_seq(QIndexVisitor)
     }
 }

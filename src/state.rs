@@ -1,6 +1,6 @@
 /// 2-bit state (Qubit / Quantum state representation: 00, 01, 10, 11)
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub enum QState {
     Q0 = 0b00,
     Q1 = 0b01,
@@ -14,10 +14,10 @@ impl QState {
     /// # Safety
     /// `val & 0b11` must be guaranteed by the caller or masked properly.
     #[inline]
-    pub const unsafe fn from_u8_unchecked(val: u8) -> Self {
+    pub const unsafe fn from_u8_unchecked(val: u8) -> Self { unsafe {
         // Safe because QState is #[repr(u8)] with values 0..=3
         std::mem::transmute(val & 0b11)
-    }
+    }}
 }
 
 impl From<u8> for QState {

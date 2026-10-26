@@ -391,5 +391,20 @@ mod tests {
             qindex_free(handle);
         }
     }
+    #[test]
+fn test_rayon_parallel_counting() {
+    let mut qi = QIndex::new();
+    // Ubacujemo 32 Q3 stanja (svako Q3 je 0b11)
+    for _ in 0..32 {
+        qi.push(QState::Q3);
+    }
+
+    // Pattern za Q3 na svim pozicijama u u32 reči je 0xFFFF_FFFF
+    let pattern = 0xFFFF_FFFF;
+    let mask = 0xFFFF_FFFF;
+
+    let matches = qi.par_count_matches(pattern, mask);
+    assert_eq!(matches, 32);
+}
 
 }

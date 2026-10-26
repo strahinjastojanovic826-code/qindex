@@ -57,3 +57,42 @@ impl<'a> IntoIterator for &'a QIndex {
         QIndexIter::new(self)
     }
 }
+
+pub struct QIndexIterMut<'a> {
+    slice: &'a mut [u32],
+    len: usize,
+    current: usize,
+}
+
+impl<'a> QIndexIterMut<'a> {
+    #[inline]
+    pub fn new(index: &'a mut QIndex) -> Self {
+        let len = index.len(); // 1. Prvo uzmemo dužinu (pozajmica se odmah završava)
+        Self {
+            slice: index.as_mut_raw_slice(), // 2. Zatim uzmemo mutabilnu pozajmicu koja traje 'a
+            len,
+            current: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for QIndexIterMut<'a> {
+    type Item = (usize, QState); // Returns index and state
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.len {
+            return None;
+        }
+        let idx = self.current;
+        let u32_idx = idx / 16;
+        let bit_shift = (idx % 16) * 2;
+
+        let chunk = unsafe { *self.slice.get_unchecked(u32_idx) };
+        let val = ((chunk >> bit_shift) & 0b11) as u8;
+
+        self.current += 1;
+        let state = unsafe { QState::from_u8_unchecked(val) };
+        Some((idx, state))
+    }
+}

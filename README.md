@@ -15,6 +15,9 @@ By storing 4 states in a single byte, `qindex` achieves a **75% reduction in RAM
 * **O(1) Access Time:** Instant bitwise retrieval and batch chunk processing (`push_u32_chunk`).
 * **Safe & Fallible API:** Support for `try_with_capacity_and_alignment` alongside safe memory abstractions.
 * **Thread-Safe:** Implements `Send` and `Sync` for multi-threaded pipelines.
+* **Serde Integration:** Optional serialization and deserialization support for data persistence and network transfer.
+* **Parallel Processing:** High-performance multi-threaded pattern matching powered by `rayon` across CPU cores.
+* **Mutable Access & Iteration:** In-place state updates via `set()` and support for mutable iterators (`QIndexIterMut`).
 
 ---
 
