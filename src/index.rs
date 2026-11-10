@@ -14,6 +14,16 @@ pub struct QIndex {
     align: usize,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GpuBufferInfo {
+    pub ptr: *const std::ffi::c_void,
+    pub byte_size: usize,
+    pub capacity_u32: usize,
+    pub alignment: usize,
+}
+
+
 impl QIndex {
     #[inline]
     fn layout_for(capacity_u32: usize, align: usize) -> Result<Layout, LayoutError> {
@@ -27,6 +37,17 @@ impl QIndex {
     /// Constructs a new empty `QIndex` with default initial capacity.
     pub fn new() -> Self {
         Self::with_capacity(64)
+    }
+
+    /// Returns a GPU-compatible buffer descriptor for safe zero-copy interop.
+    #[inline]
+    pub fn gpu_buffer_info(&self) -> GpuBufferInfo {
+        GpuBufferInfo {
+            ptr: self.ptr.as_ptr() as *const std::ffi::c_void,
+            byte_size: self.byte_size(),
+            capacity_u32: self.capacity_u32,
+            alignment: self.align,
+        }
     }
 
     /// Creates a `QIndex` with custom capacity and default 64-byte alignment.

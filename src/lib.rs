@@ -2,6 +2,7 @@ pub mod index;
 pub mod iter;
 pub mod state;
 pub mod ffi;
+pub mod sparse;
 
 pub use index::QIndex;
 pub use iter::QIndexIter;
@@ -16,6 +17,7 @@ mod tests {
     use super::ffi::*;
     use super::state::QState;
     use std::ptr;
+    use crate::sparse::RleQIndex;
 
     fn print_header(title: &str) {
         println!("\n==================================================");
@@ -405,6 +407,64 @@ fn test_rayon_parallel_counting() {
 
     let matches = qi.par_count_matches(pattern, mask);
     assert_eq!(matches, 32);
+}
+
+#[test]
+fn test_benchmark_rle_compression() {
+    const TOTAL_STATES: usize = 100_000;
+    let mut qidx = QIndex::with_capacity(TOTAL_STATES);
+    for i in 0..TOTAL_STATES {
+        let state = match i % 4 {
+            0 => QState::Q0,
+            1 => QState::Q1,
+            2 => QState::Q2,
+            _ => QState::Q3,
+        };
+        qidx.push(state);
+    }
+
+    let start = Instant::now();
+    let compressed = RleQIndex::from_qindex(&qidx);
+    let duration = start.elapsed();
+
+    println!("[BENCHMARK] RLE Compression ({} states): {:?}", TOTAL_STATES, duration);
+    assert!(!compressed.runs().is_empty());
+}
+
+#[test]
+fn test_benchmark_rle_decompression() {
+    const TOTAL_STATES: usize = 100_000;
+    let mut qidx = QIndex::with_capacity(TOTAL_STATES);
+    for i in 0..TOTAL_STATES {
+        let state = match i % 4 {
+            0 => QState::Q0,
+            1 => QState::Q1,
+            2 => QState::Q2,
+            _ => QState::Q3,
+        };
+        qidx.push(state);
+    }
+    let compressed = RleQIndex::from_qindex(&qidx);
+
+    let start = Instant::now();
+    let decompressed = compressed.to_qindex();
+    let duration = start.elapsed();
+
+    println!("[BENCHMARK] RLE Decompression ({} states): {:?}", TOTAL_STATES, duration);
+    assert_eq!(qidx, decompressed);
+}
+
+#[test]
+fn test_benchmark_gpu_buffer_info() {
+    let qidx = QIndex::with_capacity(10_000);
+
+    let start = Instant::now();
+    let gpu_info = qidx.gpu_buffer_info();
+    let duration = start.elapsed();
+
+    println!("[BENCHMARK] GPU Buffer Info generation: {:?}", duration);
+    assert!(!gpu_info.ptr.is_null());
+    assert_eq!(gpu_info.alignment, 64);
 }
 
 }

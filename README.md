@@ -18,6 +18,118 @@ By storing 4 states in a single byte, `qindex` achieves a **75% reduction in RAM
 * **Serde Integration:** Optional serialization and deserialization support for data persistence and network transfer.
 * **Parallel Processing:** High-performance multi-threaded pattern matching powered by `rayon` across CPU cores.
 * **Mutable Access & Iteration:** In-place state updates via `set()` and support for mutable iterators (`QIndexIterMut`).
+* **RLE Compression / Sparse Representation:** Built-in Run-Length Encoding (`RleQIndex`) for ultra-efficient compression of repetitive state sequences.
+* **FFI & Multi-Language Support:** C-compatible foreign function interface with ready-to-use integration examples for C, C++, and .NET (C#).
+
+---
+
+## Benchmark results
+
+| Test / Operation | Scope / Data Size | Execution Time |
+| :--- | :--- | :--- |
+| **Allocation & Initialization** | Initial state (0) | 1.4 µs[cite: 21] |
+| **Single Push & Bitwise Read** | 8 states | 4.7 µs[cite: 21] |
+| **Batch Chunk Insertion** | 16 packed states | 1.1 µs[cite: 21] |
+| **Zero-Allocation Iteration** | 24 items | 2.0 µs[cite: 21] |
+| **Bitwise Parallel Search** | 32 states | 200 ns[cite: 21] |
+| **GPU Buffer Info Generation** | QIndex buffer | 200 ns[cite: 21] |
+| **Multithreading (Send/Sync)** | Shared QIndex | 142.1 µs[cite: 21] |
+| **RLE Compression** | 100,000 states | 3.846 ms[cite: 22] |
+| **RLE Decompression** | 100,000 states | 1.9259 ms[cite: 22] |
+
+---
+
+# Third-Party Licenses
+
+This software includes open-source components developed by third parties. Below are the corresponding license notices and full legal texts for each component used in this project.
+
+## 1. Serde
+
+* **Author:** David Tolnay
+* **Repository:** https://github.com/serde-rs/serde
+* **License:** MIT / Apache 2.0 (Dual License)
+
+### MIT License
+
+Copyright (c) 2017 David Tolnay
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+### Apache License, Version 2.0
+
+Copyright (c) 2017 David Tolnay
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+2. Rayon (https://github.com/rayon-rs/rayon)
+   Copyright (c) 2015 Rayon contributors
+
+You may choose to use this library under either the MIT License or the Apache 
+License, Version 2.0.
+
+OPTION A: MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+OPTION B: Apache License, Version 2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
 ---
 
@@ -87,16 +199,73 @@ fn unpack_qstate(packed_u32: u32, index: u32) -> u32 {
 }
 ```
 
+## RLE Compression and GPUBuffer
+
+```rust
+use qindex::{QIndex, QState, sparse::RleQIndex};
+
+fn main() {
+    // Create an index (default 64-byte aligned for AVX-512 / CPU cache lines)
+    let mut index = QIndex::new();
+
+    // 1. Pre-allocate memory to avoid reallocations (for 100 2-bit states)
+    index.reserve(100);
+
+    // 2. Single item insertion (2-bit states: Q0=00, Q1=01, Q2=10, Q3=11)
+    index.push(QState::Q0);
+    index.push(QState::Q1);
+
+    // 3. Ultra-fast batch chunk insertion (inserts 16 packed Q3 states at once: 0xFFFF_FFFF)
+    index.push_u32_chunk(0xFFFF_FFFF);
+
+    assert_eq!(index.len(), 18);
+
+    // 4. Fast Bitwise Pattern Matching (counts matching state patterns directly in memory)
+    let pattern = 0xFFFF_FFFF; // Seeking 16 consecutive Q3 states
+    let mask = 0xFFFF_FFFF;
+    let matches = index.count_matches(pattern, mask);
+    println!("Found {} matching states", matches);
+
+    // 5. Idiomatic iteration over packed states
+    for state in &index {
+        println!("State: {:?}", state);
+    }
+
+    // 6. Export zero-copy byte slice for Direct-to-GPU DMA transfer
+    let _gpu_bytes: &[u8] = index.as_bytes();
+    let _gpu_u32_words: &[u32] = index.as_raw_slice();
+
+    // 7. NEW: GPU Buffer Info (Zero-Copy metadata and strict 64-byte alignment check)
+    let gpu_info = index.gpu_buffer_info();
+    println!("GPU Buffer size: {} bytes, alignment: {} bytes", gpu_info.byte_size, gpu_info.alignment);
+
+    // 8. NEW: RLE Compression (Run-Length Encoding for sparse data representation)
+    let rle_compressed = RleQIndex::from_qindex(&index);
+    let restored_index = rle_compressed.to_qindex();
+    assert_eq!(index, restored_index);
+    println!("RLE compressed into {} runs", rle_compressed.runs().len());
+
+    // 9. Reset index while retaining allocated buffer for memory reuse
+    index.clear();
+    assert!(index.is_empty());
+}
+```
+
+---
+
 ### Benchmark Summary
 
-| Feature / Operation | Execution Time | Key Highlight |
+| Test / Operation | Scope / Data Size | Execution Time |
 | :--- | :--- | :--- |
-| **Allocation & Initialization** | `~1.3 µs` | Minimal overhead for cache-aligned memory setup |
-| **Single Push & Retrieval** | `~1.2 µs` | Fast 2-bit state packing and bitwise extraction |
-| **Batch Chunk Insertion** | `~700 ns` | Instant insertion of 16 packed states at a time |
-| **Zero-Allocation Iteration** | `~1.7 µs` | Seamless traversal over packed states without heap churn |
-| **Bitwise Parallel Search** | `~300 ns` | Sub-microsecond pattern matching across packed words |
-| **Multi-Threading (`Send`/`Sync`)** | `~119.4 µs` | Thread-safe concurrent processing overhead |
+| **Allocation & Initialization** | Initial state (0) | 1.4 µs[cite: 21] |
+| **Single Push & Bitwise Read** | 8 states | 4.7 µs[cite: 21] |
+| **Batch Chunk Insertion** | 16 packed states | 1.1 µs[cite: 21] |
+| **Zero-Allocation Iteration** | 24 items | 2.0 µs[cite: 21] |
+| **Bitwise Parallel Search** | 32 states | 200 ns[cite: 21] |
+| **GPU Buffer Info Generation** | QIndex buffer | 200 ns[cite: 21] |
+| **Multithreading (Send/Sync)** | Shared QIndex | 142.1 µs[cite: 21] |
+| **RLE Compression** | 100,000 states | 3.846 ms[cite: 22] |
+| **RLE Decompression** | 100,000 states | 1.9259 ms[cite: 22] |
 ```
 
 ### Key Performance Advantages

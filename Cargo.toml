@@ -1,6 +1,6 @@
 [package]
 name = "qindex"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 authors = ["Strale <strahinjastojanovic826@gmail.com>"]
 description = "A 2-bit quaternary indexing library optimized for RAM compression and GPU DMA transfers."
