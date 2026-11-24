@@ -1,3 +1,63 @@
+// ============================================================================
+// UNSAFE & MEMORY SAFETY OVERVIEW (index.rs)
+// ============================================================================
+//
+// 1. `unsafe impl Send / Sync for GpuBufferInfo`:
+//    Allows transferring and sharing `GpuBufferInfo` descriptors across threads[cite: 40].
+//    The caller must ensure the underlying buffer pointed to by `ptr` remains
+//    valid and properly synchronized while referenced across threads[cite: 40].
+//
+// 2. `try_with_capacity_and_alignment`:
+//    Allocates `u32` storage via `alloc(layout)` and zero-initializes it with
+//    `std::ptr::write_bytes`[cite: 41]. `NonNull::new` verifies allocation
+//    success, and `layout` matches `capacity_u32` and `align`[cite: 41].
+//
+// 3. `set` & `push`:
+//    Compute `u32_idx` and `bit_shift` for 2-bit packed quaternary states and
+//    update the target `u32` lane via pointer arithmetic (`ptr.add(u32_idx)`)[cite: 41, 42].
+//    `set` asserts `index < self.len`, and `push` ensures capacity via
+//    `reserve(1)` before writing[cite: 41, 42].
+//
+// 4. `as_mut_raw_slice`, `as_raw_slice`, & `as_bytes`:
+//    Construct Rust slices (`&mut [u32]`, `&[u32]`, `&[u8]`) from `self.ptr`
+//    and computed lengths[cite: 42, 44]. Lifetimes are tied to `&mut self` or
+//    `&self`, and the buffer is initialized up to `capacity_u32` / `byte_size`[cite: 42, 44].
+//
+// 5. `clear`:
+//    Zeroes only the active `u32_used` words (`(self.len + 15) / 16`) with
+//    `write_bytes` before resetting `self.len = 0`[cite: 42].
+//
+// 6. `push_u32_chunk`:
+//    Writes a 16-state packed `u32` chunk at `u32_idx` and `bit_shift`,
+//    splitting across two adjacent `u32` words when `bit_shift != 0` after
+//    ensuring capacity for 16 states[cite: 43].
+//
+// 7. `reserve`:
+//    Reallocates the backing buffer via `realloc` from `old_layout` to
+//    `new_layout.size()` and zero-initializes newly added `u32` words[cite: 43].
+//
+// 8. `get`:
+//    Reads the `u32` word at `u32_idx`, shifts by `bit_shift`, masks `0b11`,
+//    and converts via `QState::from_u8_unchecked` after bounds checking
+//    `index < self.len`[cite: 44].
+//
+// 9. `vec_not`, `vec_and`, `vec_or`, & `vec_xor`:
+//    Iterate over `u32_used` packed `u32` lanes and write results into a
+//    newly allocated `QIndex` of matching length and alignment[cite: 45, 46].
+//    Source and destination buffers are distinct allocations with valid
+//    lengths.
+//
+// 10. `Clone::clone`:
+//     Copies `u32_used` words from `self.ptr` to `new_index.ptr` using
+//     `std::ptr::copy_nonoverlapping` into a separate allocation[cite: 47].
+//
+// 11. `Drop::drop` & `unsafe impl Send / Sync for QIndex`:
+//     Reconstructs the `Layout` from `(self.capacity_u32, self.align)` and
+//     frees the buffer with `dealloc` when `QIndex` is dropped[cite: 48].
+//     `Send` and `Sync` are implemented for `QIndex` since it owns its
+//     aligned allocation and exposes safe read/write APIs[cite: 48].
+// ============================================================================
+
 use std::alloc::{alloc, dealloc, realloc, Layout, LayoutError};
 use std::fmt;
 use std::ptr::NonNull;
@@ -23,6 +83,52 @@ pub struct GpuBufferInfo {
     pub alignment: usize,
 }
 
+unsafe impl Send for GpuBufferInfo {}
+unsafe impl Sync for GpuBufferInfo {}
+
+#[inline]
+fn u32_min_quat(a: u32, b: u32) -> u32 {
+    // Compare each 2-bit lane (0..=3) independently using borrow bit at MSB of each lane.
+    let even_mask: u32 = 0x5555_5555;
+    let odd_mask: u32 = 0xAAAA_AAAA;
+
+    // For each 2-bit pair (hi:lo), borrow when a < b:
+    // (~a & b) has 1 where a=0, b=1.
+    let a_even = a & even_mask;
+    let b_even = b & even_mask;
+    let a_odd = (a & odd_mask) >> 1;
+    let b_odd = (b & odd_mask) >> 1;
+
+    // 1 where lane a < lane b
+    let lt_lo = (!a_even) & b_even;
+    let eq_lo = !(a_even ^ b_even) & even_mask;
+    let lt_hi = ((!a_odd) & b_odd) | (eq_lo & ((!a_odd) & b_odd));
+
+    let lt_any = (lt_hi << 1) | lt_lo;
+    // Select b where lt_any lane is non-zero, otherwise a
+    let sel_b = ((lt_any | (lt_any >> 1)) & even_mask) * 3;
+    (a & !sel_b) | (b & sel_b)
+}
+
+#[inline]
+fn u32_max_quat(a: u32, b: u32) -> u32 {
+    let even_mask: u32 = 0x5555_5555;
+    let odd_mask: u32 = 0xAAAA_AAAA;
+
+    let a_even = a & even_mask;
+    let b_even = b & even_mask;
+    let a_odd = (a & odd_mask) >> 1;
+    let b_odd = (b & odd_mask) >> 1;
+
+    // 1 where lane a > lane b
+    let gt_lo = a_even & (!b_even);
+    let eq_lo = !(a_even ^ b_even) & even_mask;
+    let gt_hi = (a_odd & (!b_odd)) | (eq_lo & (a_odd & (!b_odd)));
+
+    let gt_any = (gt_hi << 1) | gt_lo;
+    let sel_b = ((gt_any | (gt_any >> 1)) & even_mask) * 3;
+    (a & !sel_b) | (b & sel_b)
+}
 
 impl QIndex {
     #[inline]
@@ -295,6 +401,157 @@ pub fn as_mut_raw_slice(&mut self) -> &mut [u32] {
 
         total_matches
     }
+
+    /// Vector quaternary NOT across all states in the index.
+    pub fn vec_not(&self) -> Self {
+        let mut out = Self::with_capacity_and_alignment(self.len, self.align);
+        let u32_used = (self.len + 15) / 16;
+        if u32_used > 0 {
+            unsafe {
+                let src = self.ptr.as_ptr();
+                let dst = out.ptr.as_ptr();
+                for i in 0..u32_used {
+                    // Invert all 2-bit lanes (0xFFFF_FFFF flips every bit)
+                    *dst.add(i) = !(*src.add(i));
+                }
+            }
+        }
+        out.len = self.len;
+        out
+    }
+
+    /// Vector quaternary AND (element-wise min) between two indices of equal length.
+    pub fn vec_and(&self, other: &Self) -> Self {
+        assert_eq!(self.len, other.len, "QIndex length mismatch in vec_and");
+        let mut out = Self::with_capacity_and_alignment(self.len, self.align);
+        let u32_used = (self.len + 15) / 16;
+        if u32_used > 0 {
+            unsafe {
+                let a_ptr = self.ptr.as_ptr();
+                let b_ptr = other.ptr.as_ptr();
+                let dst = out.ptr.as_ptr();
+                for i in 0..u32_used {
+                    *dst.add(i) = u32_min_quat(*a_ptr.add(i), *b_ptr.add(i));
+                }
+            }
+        }
+        out.len = self.len;
+        out
+    }
+
+    /// Vector quaternary OR (element-wise max) between two indices of equal length.
+    pub fn vec_or(&self, other: &Self) -> Self {
+        assert_eq!(self.len, other.len, "QIndex length mismatch in vec_or");
+        let mut out = Self::with_capacity_and_alignment(self.len, self.align);
+        let u32_used = (self.len + 15) / 16;
+        if u32_used > 0 {
+            unsafe {
+                let a_ptr = self.ptr.as_ptr();
+                let b_ptr = other.ptr.as_ptr();
+                let dst = out.ptr.as_ptr();
+                for i in 0..u32_used {
+                    *dst.add(i) = u32_max_quat(*a_ptr.add(i), *b_ptr.add(i));
+                }
+            }
+        }
+        out.len = self.len;
+        out
+    }
+
+    /// Vector quaternary XOR between two indices of equal length.
+    pub fn vec_xor(&self, other: &Self) -> Self {
+        assert_eq!(self.len, other.len, "QIndex length mismatch in vec_xor");
+        let mut out = Self::with_capacity_and_alignment(self.len, self.align);
+        let u32_used = (self.len + 15) / 16;
+        if u32_used > 0 {
+            unsafe {
+                let a_ptr = self.ptr.as_ptr();
+                let b_ptr = other.ptr.as_ptr();
+                let dst = out.ptr.as_ptr();
+                for i in 0..u32_used {
+                    *dst.add(i) = (*a_ptr.add(i)) ^ (*b_ptr.add(i));
+                }
+            }
+        }
+        out.len = self.len;
+        out
+    }
+
+    /// Finds the first index containing `target` state, or `None` if not found.
+    pub fn find_first(&self, target: QState) -> Option<usize> {
+        let target_u8 = target as u8;
+        let slice = self.as_raw_slice();
+        for (u32_idx, &chunk) in slice.iter().enumerate() {
+            let base = u32_idx * 16;
+            for lane in 0..16 {
+                let idx = base + lane;
+                if idx >= self.len {
+                    return None;
+                }
+                let val = ((chunk >> (lane * 2)) & 0b11) as u8;
+                if val == target_u8 {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns all state indices matching `target`.
+    pub fn positions(&self, target: QState) -> Vec<usize> {
+        let target_u8 = target as u8;
+        let mut result = Vec::new();
+        let slice = self.as_raw_slice();
+        for (u32_idx, &chunk) in slice.iter().enumerate() {
+            let base = u32_idx * 16;
+            for lane in 0..16 {
+                let idx = base + lane;
+                if idx >= self.len {
+                    return result;
+                }
+                let val = ((chunk >> (lane * 2)) & 0b11) as u8;
+                if val == target_u8 {
+                    result.push(idx);
+                }
+            }
+        }
+        result
+    }
+
+    /// Filters and returns a new `QIndex` keeping only states equal to `target`.
+    pub fn filter_state(&self, target: QState) -> Self {
+        let target_u8 = target as u8;
+        let mut filtered = Self::with_capacity_and_alignment(self.len, self.align);
+        let slice = self.as_raw_slice();
+        for (u32_idx, &chunk) in slice.iter().enumerate() {
+            let base = u32_idx * 16;
+            for lane in 0..16 {
+                if base + lane >= self.len {
+                    return filtered;
+                }
+                let val = ((chunk >> (lane * 2)) & 0b11) as u8;
+                if val == target_u8 {
+                    filtered.push(target);
+                }
+            }
+        }
+        filtered
+    }
+
+    /// Filters and returns a new `QIndex` keeping only states matching `predicate`.
+    pub fn filter_by<F>(&self, mut predicate: F) -> Self
+    where
+        F: FnMut(QState) -> bool,
+    {
+        let mut filtered = Self::with_capacity_and_alignment(self.len, self.align);
+        for state in self.into_iter() {
+            if predicate(state) {
+                filtered.push(state);
+            }
+        }
+        filtered
+    }
+
 }
 
 impl Default for QIndex {

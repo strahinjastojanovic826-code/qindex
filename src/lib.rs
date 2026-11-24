@@ -467,4 +467,198 @@ fn test_benchmark_gpu_buffer_info() {
     assert_eq!(gpu_info.alignment, 64);
 }
 
+#[test]
+    fn test_quaternary_scalar_logic_and_benchmark() {
+        const ITERATIONS: usize = 500_000;
+        let mut acc = 0usize;
+
+        let start = Instant::now();
+        for i in 0..ITERATIONS {
+            let a = QState::from((i % 4) as u8);
+            let b = QState::from(((i * 3) % 4) as u8);
+            let r = a.q_and(b).q_or(a.q_xor(b)).q_not();
+            acc += r as usize;
+        }
+        let elapsed = start.elapsed();
+
+        assert_eq!(QState::Q0.q_not(), QState::Q3);
+        assert_eq!(QState::Q1.q_not(), QState::Q2);
+        assert_eq!(QState::Q2.q_and(QState::Q1), QState::Q1);
+        assert_eq!(QState::Q2.q_or(QState::Q1), QState::Q2);
+        assert_eq!(QState::Q2.q_xor(QState::Q3), QState::Q1);
+        assert!(acc > 0);
+
+        println!(
+            "[BENCHMARK] Quaternary scalar logic ({} iters): {:?}",
+            ITERATIONS, elapsed
+        );
+    }
+
+    #[test]
+    fn test_vector_quaternary_logic_and_benchmark() {
+        const TOTAL_STATES: usize = 100_000;
+        let mut lhs = QIndex::with_capacity(TOTAL_STATES);
+        let mut rhs = QIndex::with_capacity(TOTAL_STATES);
+
+        for i in 0..TOTAL_STATES {
+            lhs.push(QState::from((i % 4) as u8));
+            rhs.push(QState::from(((i / 2) % 4) as u8));
+        }
+
+        let start = Instant::now();
+        let inv = lhs.vec_not();
+        let and_res = lhs.vec_and(&rhs);
+        let or_res = lhs.vec_or(&rhs);
+        let xor_res = lhs.vec_xor(&rhs);
+        let elapsed = start.elapsed();
+
+        assert_eq!(inv.len(), TOTAL_STATES);
+        assert_eq!(inv.get(0), Some(QState::Q0.q_not()));
+        assert_eq!(and_res.get(2), Some(QState::Q2.q_and(QState::Q1)));
+        assert_eq!(or_res.get(2), Some(QState::Q1));
+        assert_eq!(xor_res.get(2), Some(QState::Q2.q_xor(QState::Q1)));
+
+        println!(
+            "[BENCHMARK] Vector quaternary logic ({} states): {:?}",
+            TOTAL_STATES, elapsed
+        );
+    }
+
+    #[test]
+    fn test_search_and_filter_and_benchmark() {
+        const TOTAL_STATES: usize = 100_000;
+        let mut qi = QIndex::with_capacity(TOTAL_STATES);
+        for i in 0..TOTAL_STATES {
+            qi.push(QState::from((i % 4) as u8));
+        }
+
+        let start = Instant::now();
+        let first_q2 = qi.find_first(QState::Q2);
+        let q2_positions = qi.positions(QState::Q2);
+        let filtered_q2 = qi.filter_state(QState::Q2);
+        let filtered_high = qi.filter_by(|s| (s as u8) >= 2);
+        let elapsed = start.elapsed();
+
+        assert_eq!(first_q2, Some(2));
+        assert_eq!(q2_positions.len(), TOTAL_STATES / 4);
+        assert_eq!(filtered_q2.len(), TOTAL_STATES / 4);
+        assert_eq!(filtered_high.len(), TOTAL_STATES / 2);
+
+        println!(
+            "[BENCHMARK] Search & filter ({} states): {:?}",
+            TOTAL_STATES, elapsed
+        );
+    }
+
+    #[test]
+    fn test_block_rle_compression_and_benchmark() {
+        const TOTAL_STATES: usize = 100_000;
+        const BLOCK_SIZE: usize = 4096;
+        let mut qi = QIndex::with_capacity(TOTAL_STATES);
+        for i in 0..TOTAL_STATES {
+            qi.push(QState::from(((i / 64) % 4) as u8));
+        }
+
+        let start = Instant::now();
+        let blocked = crate::sparse::BlockRleQIndex::from_qindex_blocked(&qi, BLOCK_SIZE);
+        let restored = blocked.to_qindex();
+        let elapsed = start.elapsed();
+
+        assert_eq!(blocked.len(), TOTAL_STATES);
+        assert!(!blocked.is_empty());
+        assert!(blocked.block_count() > 1);
+        assert_eq!(restored.len(), TOTAL_STATES);
+        assert_eq!(restored, qi);
+
+        println!(
+            "[BENCHMARK] Block RLE compress + decompress ({} states, block_size={}): {:?}",
+            TOTAL_STATES, BLOCK_SIZE, elapsed
+        );
+    }
+
+    #[test]
+    fn test_chunk_streaming_and_benchmark() {
+        const TOTAL_STATES: usize = 100_000;
+        const CHUNK_STATES: usize = 4096;
+        let mut qi = QIndex::with_capacity(TOTAL_STATES);
+        for i in 0..TOTAL_STATES {
+            qi.push(QState::from((i % 4) as u8));
+        }
+
+        let start = Instant::now();
+        let mut streamed_states = 0usize;
+        let mut chunk_count = 0usize;
+        crate::iter::stream_qindex_chunks(&qi, CHUNK_STATES, |chunk| {
+            streamed_states += chunk.state_count;
+            chunk_count += 1;
+            assert!(!chunk.raw_u32_words.is_empty());
+        });
+        let elapsed = start.elapsed();
+
+        assert_eq!(streamed_states, TOTAL_STATES);
+        assert!(chunk_count > 0);
+
+        println!(
+            "[BENCHMARK] Chunk streaming ({} states, chunk={}): {:?}",
+            TOTAL_STATES, CHUNK_STATES, elapsed
+        );
+    }
+
+    #[test]
+    fn test_ffi_staging_and_checked_ops_and_benchmark() {
+        const BENCH_OPS: usize = 50_000;
+        let start = Instant::now();
+
+        unsafe {
+            let handle = qindex_new();
+            assert!(!handle.is_null());
+
+            assert_eq!(
+                crate::ffi::qindex_push_checked(handle, 5),
+                crate::ffi::QIndexFfiStatus::InvalidQuatState
+            );
+            assert_eq!(
+                crate::ffi::qindex_push_checked(handle, 2),
+                crate::ffi::QIndexFfiStatus::Ok
+            );
+
+            let mut out_val: u8 = 99;
+            assert_eq!(
+                crate::ffi::qindex_get_checked(handle, 0, &mut out_val),
+                crate::ffi::QIndexFfiStatus::Ok
+            );
+            assert_eq!(out_val, 2);
+
+            assert_eq!(
+                crate::ffi::qindex_get_checked(handle, 10, &mut out_val),
+                crate::ffi::QIndexFfiStatus::OutOfBounds
+            );
+
+            for i in 0..BENCH_OPS {
+                assert_eq!(
+                    crate::ffi::qindex_push_checked(handle, (i % 4) as u8),
+                    crate::ffi::QIndexFfiStatus::Ok
+                );
+            }
+
+            let staged = crate::ffi::qindex_alloc_staging(
+                1024,
+                64,
+                crate::ffi::GpuMemoryProfile::PinnedHost,
+            );
+            assert!(!staged.ptr.is_null());
+            assert_eq!(staged.byte_len, 256);
+            assert_eq!(staged.align, 64);
+            crate::ffi::qindex_free_staging(staged);
+
+            qindex_free(handle);
+        }
+
+        let elapsed = start.elapsed();
+        println!(
+            "[BENCHMARK] FFI checked ops + staging ({} pushes): {:?}",
+            BENCH_OPS, elapsed
+        );
+    }
+
 }
